@@ -3,5 +3,5 @@ uvicorn
 pandas
 joblib
 python-multipart
-torch
 numpy
+scikit-learn
