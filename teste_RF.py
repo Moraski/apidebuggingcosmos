@@ -1,59 +1,110 @@
-#!/usr/bin/env python3
-"""
-Script para usar o modelo Random Forest de exoplanetas
-- Lê um CSV novo
-- Faz previsões (0=FALSE POSITIVE, 1=CONFIRMED)
-- Mostra probabilidade de CONFIRMED
-"""
-
-import joblib
-import pandas as pd
+from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import torch
+import torch.nn as nn
+import numpy as np
 import os
+import pandas as pd
 
-# Caminhos
-MODEL_PATH = r"C:\Users\thecr\Desktop\ProjetoNasaWorkspace\IA\exoplanet_rf.joblib"
-NEW_DATA_CSV = r"C:\Users\thecr\Desktop\ProjetoNasaWorkspace\IA\data.csv"  # CSV fornecido
+# ==== FastAPI setup ====
+app = FastAPI()
 
-# Verifica se arquivos existem
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ==== Definição do modelo (igual ao treino) ====
+class ResidualBlock(nn.Module):
+    def __init__(self, size, dropout_rate, activation_fn):
+        super().__init__()
+        self.fc1 = nn.Linear(size, size)
+        self.norm = nn.LayerNorm(size)
+        self.fc2 = nn.Linear(size, size)
+        self.dropout = nn.Dropout(dropout_rate)
+        self.activation = getattr(nn, activation_fn)()
+
+    def forward(self, x):
+        residual = x
+        out = self.activation(self.fc1(x))
+        out = self.norm(out)
+        out = self.dropout(out)
+        out = self.fc2(out)
+        out = self.dropout(out)
+        return self.activation(out + residual)
+
+class SpectraMLP(nn.Module):
+    def __init__(self, config, num_inputs, num_outputs):
+        super().__init__()
+        size = config['model']['num_neurons']
+        act = config['model']['activation_fn']
+        self.input_layer = nn.Linear(num_inputs, size)
+        self.res_blocks = nn.Sequential(
+            *[ResidualBlock(size, config['model']['dropout_rate'], act)
+              for _ in range(config['model']['num_res_blocks'])]
+        )
+        self.output_layer = nn.Linear(size, num_outputs)
+        self.activation = getattr(nn, act)()
+
+    def forward(self, x):
+        x = self.activation(self.input_layer(x))
+        x = self.res_blocks(x)
+        x = self.output_layer(x)
+        return x
+
+# ==== Configurações do modelo ====
+config = {
+    "model": {
+        "num_neurons": 512,
+        "num_res_blocks": 4,
+        "dropout_rate": 0.1,
+        "activation_fn": "SiLU"
+    }
+}
+
+num_inputs = 7673   # ajuste para o seu caso real
+num_outputs = 16    # número de saídas
+
+# ==== Carrega o modelo ====
+MODEL_PATH = "best_model.pt"
 if not os.path.exists(MODEL_PATH):
     raise FileNotFoundError(f"Modelo não encontrado em {MODEL_PATH}")
-if not os.path.exists(NEW_DATA_CSV):
-    raise FileNotFoundError(f"CSV de dados não encontrado em {NEW_DATA_CSV}")
 
-# Carrega o modelo
-model_data = joblib.load(MODEL_PATH)
-model = model_data["model"]
-features = model_data["features"]
+model = SpectraMLP(config, num_inputs, num_outputs)
+model.load_state_dict(torch.load(MODEL_PATH, map_location="cpu"))
+model.eval()
 
-# Lê novos dados
-data = pd.read_csv(NEW_DATA_CSV)
+# ==== Endpoints ====
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
 
-# Confere se todas as features existem
-missing = [f for f in features if f not in data.columns]
-if missing:
-    raise ValueError(f"Faltando colunas no CSV: {missing}")
+@app.post("/predict")
+async def predict(file: UploadFile = File(...)):
+    """
+    Recebe CSV com features, retorna previsões e probabilidades.
+    """
+    try:
+        df = pd.read_csv(file.file)
 
-# Prepara dados
-X_new = data[features].to_numpy()
+        # Confere se há colunas suficientes
+        if df.shape[1] != num_inputs:
+            return JSONResponse(
+                status_code=400,
+                content={"erro": f"Número de colunas do CSV ({df.shape[1]}) diferente do esperado ({num_inputs})"}
+            )
 
-# Faz previsões
-y_pred = model.predict(X_new)
-y_proba = model.predict_proba(X_new)[:, 1]  # probabilidade de CONFIRMED
+        # Converte para tensor
+        X = torch.from_numpy(df.to_numpy(dtype=np.float32))
 
-# Adiciona resultados ao DataFrame
-data["predicao"] = y_pred
-data["prob_CONFIRMED"] = y_proba
+        with torch.no_grad():
+            preds = model(X).numpy()
 
-# Converte predicao para texto
-data["predicao_texto"] = data["predicao"].map({0: "FALSE POSITIVE", 1: "CONFIRMED"})
+        # Retorna previsões como lista
+        return {"predictions": preds.tolist(), "num_samples": len(df)}
 
-# Colunas para mostrar
-cols_to_show = ["loc_rowid", "kepid", "kepler_name", "predicao_texto", "prob_CONFIRMED"]
-
-# Confere se as colunas existem
-for col in ["loc_rowid", "kepid", "kepler_name"]:
-    if col not in data.columns:
-        raise ValueError(f"Coluna {col} não encontrada no CSV")
-
-# Mostra resultado
-print(data[cols_to_show])
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"erro": str(e)})
